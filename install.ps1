@@ -16,15 +16,21 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Write-Host "dough: downloading $asset..."
 Invoke-WebRequest -Uri $url -OutFile $dest
 
-# Add the install dir to the user PATH if it isn't already there.
+# Persist the install dir on the user PATH (applies to future terminals).
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not $userPath) { $userPath = "" }
 if ($userPath -notlike "*$dir*") {
   $newPath = if ($userPath) { "$userPath;$dir" } else { $dir }
   [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-  Write-Host "dough: added $dir to your user PATH (open a new terminal to pick it up)."
+}
+
+# Make `dough` usable in THIS session immediately (the persistent PATH above
+# only reaches new terminals).
+if (";$env:Path;" -notlike "*;$dir;*") {
+  $env:Path = "$env:Path;$dir"
 }
 
 Write-Host "dough: installed to $dest"
+Write-Host "dough: ready to use now; new terminals will also have it on PATH."
 Write-Host ""
-Write-Host "Next: dough login --url https://app.usedough.ai"
+Write-Host "Next: dough login"
