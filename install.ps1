@@ -31,6 +31,14 @@ if (";$env:Path;" -notlike "*;$dir;*") {
 }
 
 Write-Host "dough: installed to $dest"
+
+# Refresh the on-disk observability dispatcher (~/Dough/.dough/dough_trace.py) to
+# match this CLI version. The dispatcher is otherwise only refreshed by the
+# SessionStart self-heal hook, which older dispatchers skip for sessions run
+# outside an agent checkout — so a plain CLI upgrade would not reach them. This
+# is best-effort and offline (writes local files only); never fail the install.
+try { & $dest self-heal *> $null } catch { }
+
 Write-Host "dough: ready to use now; new terminals will also have it on PATH."
 Write-Host ""
 Write-Host "Next: dough login"

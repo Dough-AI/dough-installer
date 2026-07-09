@@ -47,6 +47,13 @@ chmod +x "$tmp"
 mv "$tmp" "$bindir/dough"
 echo "dough: installed to $bindir/dough" >&2
 
+# Refresh the on-disk observability dispatcher (~/Dough/.dough/dough_trace.py) to
+# match this CLI version. The dispatcher is otherwise only refreshed by the
+# SessionStart self-heal hook, which older dispatchers skip for sessions run
+# outside an agent checkout — so a plain CLI upgrade would not reach them. This
+# is best-effort and offline (writes local files only); never fail the install.
+"$bindir/dough" self-heal >/dev/null 2>&1 || true
+
 # PATH hint if needed.
 case ":$PATH:" in
   *":$bindir:"*) ;;
