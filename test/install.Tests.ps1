@@ -137,14 +137,24 @@ function Set-PythonShim {
   & chmod +x $stub
 }
 
-# Control: the isolation itself must work. If PATH did not take effect in the
-# child, git would still be found here and this check would fail - which is the
-# point of running it first.
-Check "CONTROL: git is NOT found when PATH holds only the shim dir" {
-  (Invoke-Probe "Test-GitReady" $shimDir) -eq $false
+# Controls: the isolation itself must work, proven in BOTH directions with the
+# SAME probe. One direction alone cannot distinguish "the restricted PATH took
+# effect" from "this probe always answers false".
+#
+# Test-PythonReady is the probe used here because this machine has a real
+# python3 on its real PATH. (Test-GitReady cannot serve: it requires Git for
+# Windows' bash.exe, so it is correctly false on macOS either way - which is
+# exactly the always-false control that would prove nothing.)
+$emptyDir = Join-Path ([System.IO.Path]::GetTempPath()) "dough-empty-$PID"
+New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+Check "CONTROL: python IS found with this machine's real PATH" {
+  (Invoke-Probe "Test-PythonReady" $env:PATH) -eq $true
 }
-Check "CONTROL: git IS found with this machine's real PATH" {
-  (Invoke-Probe "Test-GitReady" $env:PATH) -eq $true
+Check "CONTROL: python is NOT found when PATH holds only an empty dir" {
+  (Invoke-Probe "Test-PythonReady" $emptyDir) -eq $false
+}
+Check "git is not found when PATH holds only the shim dir" {
+  (Invoke-Probe "Test-GitReady" $shimDir) -eq $false
 }
 
 # The Microsoft Store stub: on PATH, resolves, runs, but is not Python. This is
@@ -171,7 +181,7 @@ Check "rejects a python that exits 0 but prints nothing" {
   (Invoke-Probe "Test-PythonReady" $shimDir) -eq $false
 }
 
-Remove-Item -Recurse -Force $shimDir, $fakeHome -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $shimDir, $fakeHome, $emptyDir -ErrorAction SilentlyContinue
 
 # --- Install-Dependency ------------------------------------------------------
 # winget does not exist on this machine, which makes the failure path directly
@@ -207,6 +217,90 @@ Check "carries a winget diagnostic into the failure message" {
   } catch { $threw = $_.Exception.Message }
   # Either an exit code or the "could not be run" branch, never an empty slot.
   $threw -match "exit code|could not be run"
+}
+
+# --- Set-ClaudeEnvSetting ----------------------------------------------------
+# This rewrites the file that holds the Dough hooks, so the thing under test is
+# as much "what survived" as "what was written".
+Write-Host "`nSet-ClaudeEnvSetting" -ForegroundColor Cyan
+
+$envHome = Join-Path ([System.IO.Path]::GetTempPath()) "dough-env-$PID"
+$envSettings = Join-Path $envHome ".claude/settings.json"
+$bashPath = 'C:\Program Files\Git\bin\bash.exe'
+
+function Reset-Settings {
+  param([string]$Content)
+  Remove-Item -Recurse -Force $envHome -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path (Join-Path $envHome ".claude") | Out-Null
+  $env:USERPROFILE = $envHome
+  if ($null -ne $Content) { Set-Content -LiteralPath $envSettings -Value $Content }
+}
+
+Reset-Settings -Content $null
+Check "creates settings.json when it does not exist" {
+  (Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $bashPath) -eq "set" -and
+  ((Get-Content -Raw $envSettings | ConvertFrom-Json).env.CLAUDE_CODE_GIT_BASH_PATH -eq $bashPath)
+}
+
+Check "reports 'current' and rewrites nothing on a second run" {
+  (Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $bashPath) -eq "current"
+}
+
+Reset-Settings -Content '{ "permissions": { "allow": ["Bash(ls:*)"] }, "model": "opus" }'
+Check "preserves unrelated existing keys" {
+  Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $bashPath | Out-Null
+  $s = Get-Content -Raw $envSettings | ConvertFrom-Json
+  $s.model -eq "opus" -and $s.permissions.allow[0] -eq "Bash(ls:*)" -and
+  $s.env.CLAUDE_CODE_GIT_BASH_PATH -eq $bashPath
+}
+
+Reset-Settings -Content '{ "env": { "DISABLE_AUTOUPDATER": "1" } }'
+Check "merges into an existing env block rather than replacing it" {
+  Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $bashPath | Out-Null
+  $s = Get-Content -Raw $envSettings | ConvertFrom-Json
+  $s.env.DISABLE_AUTOUPDATER -eq "1" -and $s.env.CLAUDE_CODE_GIT_BASH_PATH -eq $bashPath
+}
+
+# THE important one. The hooks block is five levels deep; ConvertTo-Json defaults
+# to -Depth 2, which would silently replace it with type-name strings. This test
+# is what pins -Depth 100.
+$deepHook = "python -c ""import os,runpy;p=r'$dispatcherPath';os.path.exists(p) and runpy.run_path(p,run_name='__main__')"" pre"
+Reset-Settings -Content (@{ hooks = @{ PreToolUse = @(@{ matcher = ".*"; hooks = @(@{ type = "command"; command = $deepHook }) }) } } | ConvertTo-Json -Depth 10)
+Check "does not destroy the deeply-nested hooks block (ConvertTo-Json depth)" {
+  Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $bashPath | Out-Null
+  $s = Get-Content -Raw $envSettings | ConvertFrom-Json
+  $s.hooks.PreToolUse[0].hooks[0].command -eq $deepHook -and
+  $s.env.CLAUDE_CODE_GIT_BASH_PATH -eq $bashPath
+}
+Check "leaves the Dough hook still resolvable after the write" {
+  (Get-RegisteredDispatcherPath) -eq $dispatcherPath
+}
+Check "removes its backup on success" {
+  @(Get-ChildItem -Path (Split-Path $envSettings) -Filter "*.dough-backup-*").Count -eq 0
+}
+
+Reset-Settings -Content '{ this is not json'
+Check "refuses to touch malformed settings.json and leaves it byte-identical" {
+  $before = Get-Content -Raw $envSettings
+  $threw = $null
+  try { Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $bashPath | Out-Null }
+  catch { $threw = $_.Exception.Message }
+  $null -ne $threw -and $threw.Contains("not valid JSON") -and
+  (Get-Content -Raw $envSettings) -eq $before
+}
+
+Remove-Item -Recurse -Force $envHome -ErrorAction SilentlyContinue
+
+# --- Get-GitBashPath ---------------------------------------------------------
+Write-Host "`nGet-GitBashPath" -ForegroundColor Cyan
+
+Check "returns null on this machine (no Git for Windows layout here)" {
+  $null -eq (Get-GitBashPath)
+}
+Check "Test-GitReady is false without bash.exe, even though git runs here" {
+  # git IS installed on this Mac and `git --version` succeeds, so a probe that
+  # only checked that would return true. Requiring bash.exe is the whole point.
+  (& { git --version *> $null; $LASTEXITCODE }) -eq 0 -and (Test-GitReady) -eq $false
 }
 
 Write-Host ""

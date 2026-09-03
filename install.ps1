@@ -1,9 +1,10 @@
 # Dough setup for Windows - one command, from nothing to a working install.
 #   irm https://raw.githubusercontent.com/Dough-AI/dough-installer/main/install.ps1 | iex
 #
-# In order: Python, Git, the `dough` CLI, the observability hooks, the Claude
-# Code plugin, and sign-in. Safe to re-run: every step is check-then-act, so
-# re-running is also how you update the CLI and the plugin.
+# In order: Python, Git for Windows, the `dough` CLI, the observability hooks,
+# the Claude Code plugin, the Git Bash path Claude Code needs, and sign-in. Safe
+# to re-run: every step is check-then-act, so re-running is also how you update
+# the CLI and the plugin.
 #
 # Env overrides:
 #   DOUGH_REPO        release repo (default: Dough-AI/dough-installer)
@@ -87,14 +88,50 @@ function Test-PythonReady {
   }
 }
 
+# Locates Git for Windows' bash.exe, or $null.
+#
+# The Claude Code desktop app refuses to run local sessions without it ("Git for
+# Windows is required to run local sessions"), and `git` being on PATH does not
+# imply it: a git from Scoop, or a minimal build, has no bash.exe. So the Git
+# requirement is expressed in terms of THIS file, not `git --version`.
+#
+# Preferred derivation is from git.exe itself (`<GitRoot>\cmd\git.exe` ->
+# `<GitRoot>\bin\bash.exe`), so a non-default install location still resolves;
+# the fixed paths are the fallback.
+function Get-GitBashPath {
+  $candidates = @()
+
+  $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+  if ($gitCmd -and $gitCmd.Source) {
+    $gitRoot = Split-Path -Parent (Split-Path -Parent $gitCmd.Source)
+    if ($gitRoot) { $candidates += (Join-Path $gitRoot "bin\bash.exe") }
+  }
+
+  # Each root is guarded BEFORE Join-Path touches it: Join-Path throws on a null
+  # Path, so building this list unguarded turns a probe that should answer "no"
+  # into one that raises.
+  $roots = @()
+  if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
+  if (${env:ProgramFiles(x86)}) { $roots += ${env:ProgramFiles(x86)} }
+  if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA "Programs") }
+  foreach ($root in $roots) { $candidates += (Join-Path $root "Git\bin\bash.exe") }
+
+  foreach ($candidate in $candidates) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+  }
+  return $null
+}
+
 function Test-GitReady {
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $false }
   try {
     & git --version *> $null
-    return ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -ne 0) { return $false }
   } catch {
     return $false
   }
+  # bash.exe, not just git: see Get-GitBashPath.
+  return $null -ne (Get-GitBashPath)
 }
 
 # The Store stub above can also SHADOW a real Python install when it sits
@@ -176,6 +213,97 @@ function Get-RegisteredDispatcherPath {
   return $null
 }
 
+function Get-ClaudeSettingsPath {
+  $profileDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+  return (Join-Path $profileDir ".claude\settings.json")
+}
+
+# Sets settings.env.<Name> = <Value> in ~/.claude/settings.json, preserving
+# everything else. Returns "set" or "current".
+#
+# This rewrites the same file that holds the hooks registered a step earlier, so
+# it is written defensively: back up, write, then RE-READ and confirm both the
+# new value AND the pre-existing dough hook survived; restore the backup and
+# throw if either did not.
+#
+# The specific hazard is ConvertTo-Json's default -Depth of 2. The hooks block is
+# five levels deep (hooks > event > matcher > hooks > command), so a round-trip
+# at the default depth silently replaces it with type names and would destroy
+# observability on every machine this runs on.
+function Set-ClaudeEnvSetting {
+  param([string]$Name, [string]$Value)
+
+  $settingsPath = Get-ClaudeSettingsPath
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $settingsPath) | Out-Null
+
+  $settings = $null
+  if (Test-Path -LiteralPath $settingsPath) {
+    $raw = Get-Content -Raw -LiteralPath $settingsPath
+    if ("$raw".Trim()) {
+      try {
+        $settings = $raw | ConvertFrom-Json
+      } catch {
+        throw (Format-SetupError `
+          "$settingsPath exists but is not valid JSON, so it cannot be updated safely." `
+          @(
+            "Fix or remove that file, then re-run:",
+            "  irm $InstallerUrl | iex"
+          ))
+      }
+    }
+  }
+  if ($null -eq $settings) { $settings = [pscustomobject]@{} }
+
+  if ($settings.env -and $settings.env.$Name -eq $Value) { return "current" }
+
+  $hookBefore = Get-RegisteredDispatcherPath
+
+  if (-not $settings.PSObject.Properties['env'] -or $null -eq $settings.env) {
+    $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([pscustomobject]@{}) -Force
+  }
+  if ($settings.env.PSObject.Properties[$Name]) {
+    $settings.env.$Name = $Value
+  } else {
+    $settings.env | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+  }
+
+  $backup = $null
+  if (Test-Path -LiteralPath $settingsPath) {
+    $backup = "$settingsPath.dough-backup-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Copy-Item -LiteralPath $settingsPath -Destination $backup -Force
+  }
+
+  # -Depth 100: see the note above. Never lower this.
+  Set-Content -LiteralPath $settingsPath -Value ($settings | ConvertTo-Json -Depth 100)
+
+  # Verify the OUTCOME, not the write. Both halves matter: the value we came to
+  # set, and the hook we must not have destroyed getting there.
+  $failure = $null
+  try {
+    $after = Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json
+    if ($after.env.$Name -ne $Value) { $failure = "$Name was not saved" }
+    elseif ($hookBefore -and (Get-RegisteredDispatcherPath) -ne $hookBefore) {
+      $failure = "the Dough hook registration did not survive the write"
+    }
+  } catch {
+    $failure = "the file is no longer valid JSON"
+  }
+
+  if ($failure) {
+    if ($backup) { Copy-Item -LiteralPath $backup -Destination $settingsPath -Force }
+    throw (Format-SetupError `
+      "Updating $settingsPath failed: $failure." `
+      @(
+        "Your previous settings have been restored$(if ($backup) { " (backup kept at $backup)" }).",
+        "Set it by hand instead - add this to $settingsPath :",
+        "  `"env`": { `"$Name`": `"$($Value -replace '\\','\\')`" }"
+      ))
+  }
+
+  if ($backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
+  return "set"
+}
+
 function Invoke-DoughSetup {
   Write-Host ""
   Write-Host "Dough setup for Windows" -ForegroundColor White
@@ -222,11 +350,15 @@ function Invoke-DoughSetup {
     $lines
   }
 
-  # --- 2. Git ---------------------------------------------------------------
-  # Needed by the Claude Code desktop app.
-  Install-Dependency -Name "Git" -WingetId $GitWingetId -Probe ${function:Test-GitReady} -Fix {
+  # --- 2. Git for Windows ---------------------------------------------------
+  # The desktop app refuses to run local sessions without Git Bash: "Git for
+  # Windows is required to run local sessions." The probe therefore requires
+  # bash.exe, not just `git` on PATH - a git without it satisfies `git --version`
+  # and still leaves the app blocked.
+  Install-Dependency -Name "Git for Windows" -WingetId $GitWingetId -Probe ${function:Test-GitReady} -Fix {
     @(
-      "Install Git for Windows:",
+      "Install Git for Windows - not another git build; the Claude Code desktop app",
+      "needs the Git Bash that ships with it (bash.exe):",
       "  https://git-scm.com/download/win",
       "",
       "Then open a new PowerShell and re-run:",
@@ -368,7 +500,46 @@ function Invoke-DoughSetup {
   }
   Write-Good "Plugin installed."
 
-  # --- 6. Sign in -----------------------------------------------------------
+  # --- 6. Point Claude Code at Git Bash -------------------------------------
+  # Without this the desktop app can open on a machine that has Git for Windows
+  # and still say "Git for Windows is required to run local sessions. If it's
+  # already installed, set the CLAUDE_CODE_GIT_BASH_PATH environment variable..."
+  #
+  # Both mechanisms are written, deliberately. settings.json is the DOCUMENTED
+  # one (code.claude.com/docs/en/setup shows exactly this env block), while the
+  # environment variable is the one the app's own error message names - and there
+  # are open reports of the variable alone not being honoured. Neither is
+  # expensive, and only the pair covers what the app actually reads.
+  #
+  # Runs last of the writers: `dough plugin install` also rewrites settings.json.
+  # It preserves unknown keys, so order is not strictly required - but being the
+  # last writer means that guarantee is not load-bearing.
+  Write-Step "Git Bash for Claude Code"
+  $gitBash = Get-GitBashPath
+  if (-not $gitBash) {
+    # Unreachable via the probe above, which already requires this file; kept so
+    # a future reordering fails loudly instead of writing an empty setting.
+    throw (Format-SetupError `
+      "Git for Windows is installed but bash.exe could not be located." `
+      @(
+        "Reinstall Git for Windows and re-run:",
+        "  https://git-scm.com/download/win",
+        "  irm $InstallerUrl | iex"
+      ))
+  }
+
+  $envResult = Set-ClaudeEnvSetting -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $gitBash
+  if (([Environment]::GetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH", "User")) -ne $gitBash) {
+    [Environment]::SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH", $gitBash, "User")
+  }
+  $env:CLAUDE_CODE_GIT_BASH_PATH = $gitBash
+  if ($envResult -eq "current") {
+    Write-Good "Already pointing at $gitBash"
+  } else {
+    Write-Good "Pointed Claude Code at $gitBash"
+  }
+
+  # --- 7. Sign in -----------------------------------------------------------
   Write-Step "Sign in"
   if ($env:DOUGH_SKIP_LOGIN -eq "1") {
     Write-Note "DOUGH_SKIP_LOGIN=1 - skipping. Run 'dough login' when you're ready."

@@ -25,12 +25,14 @@ This is the whole setup, not just the binary. In order it:
 1. checks `winget` is available;
 2. installs **Python 3** if `python` isn't already a working interpreter — Claude Code
    runs the Dough hooks with it;
-3. installs **Git** if missing — the Claude Code desktop app needs it;
+3. installs **Git for Windows** if missing — the Claude Code desktop app needs the
+   Git Bash (`bash.exe`) that ships with it;
 4. downloads `dough.exe` to `%LOCALAPPDATA%\dough\bin`, adds it to your user PATH, and
    confirms it runs;
 5. registers the Claude Code hooks and verifies they landed;
 6. installs the Claude Code plugin;
-7. signs you in (skipped if you already have a session).
+7. points Claude Code at Git Bash, so the desktop app does not refuse local sessions;
+8. signs you in (skipped if you already have a session).
 
 It's safe to re-run: every step checks before it acts, so re-running is also how you
 update the CLI and the plugin. It stops at the first thing it can't fix and tells you
@@ -70,11 +72,13 @@ pwsh -NoProfile -File test/install.Tests.ps1
 Lint and parse it too:
 
 ```sh
-pwsh -NoProfile -Command 'Import-Module PSScriptAnalyzer; Invoke-ScriptAnalyzer -Path install.ps1 -ExcludeRule PSAvoidUsingWriteHost'
+pwsh -NoProfile -Command 'Import-Module PSScriptAnalyzer; Invoke-ScriptAnalyzer -Path install.ps1 -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions'
 ```
 
-`PSAvoidUsingWriteHost` is excluded deliberately — this is an installer whose output is
-for a human watching a terminal.
+That should report **zero** findings. Two rules are excluded deliberately, and only two:
+`PSAvoidUsingWriteHost`, because this is an installer whose output is for a human watching
+a terminal, and `PSUseShouldProcessForStateChangingFunctions`, which fires on verb names
+alone and wants `-WhatIf` support that a bootstrap script has no caller for.
 
 > Linux support is coming soon.
 
