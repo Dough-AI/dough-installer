@@ -9,8 +9,32 @@ repo holds only the installer script and the compiled, release binaries.
 curl -fsSL https://raw.githubusercontent.com/Dough-AI/dough-installer/main/install.sh | sh
 ```
 
-This downloads the right binary for your Mac (Apple Silicon or Intel) and installs
-it to `/usr/local/bin` (or `~/.local/bin` if that isn't writable).
+This is the whole setup, not just the binary. In order it:
+
+1. makes sure **python3** and **git** are there — Claude Code runs the Dough hooks
+   with python3, and on macOS both tools come from Apple's Command Line Tools, so
+   if those are missing it opens Apple's installer and waits for it to finish;
+2. downloads the right binary for your Mac (Apple Silicon or Intel) to
+   `/usr/local/bin`, or `~/.local/bin` if that isn't writable, and confirms it runs;
+3. adds that directory to your `PATH` in your shell profile, if it isn't already;
+4. registers the Claude Code hooks and verifies they landed;
+5. installs the Claude Code plugin;
+6. signs you in (skipped if you already have a session).
+
+It's safe to re-run: every step checks before it acts, so re-running is also how
+you update the CLI and the plugin. It stops at the first thing it can't fix and
+tells you what to do.
+
+**After it finishes, fully quit Claude Code and reopen it** — Cmd+Q, or right-click
+the Dock icon and Quit. Closing the window is not enough; Claude Code reads the
+plugin and hooks at startup.
+
+You'll also need a **new terminal** before the `dough` command works. The installer
+runs in its own shell and can't change the `PATH` of the window you started it from.
+
+Environment overrides: `DOUGH_BIN_DIR`, `DOUGH_REPO`, `DOUGH_SKIP_LOGIN=1`
+(leave `dough login` to you), `DOUGH_SKIP_PROFILE=1` (never edit a shell profile),
+`DOUGH_CLT_WAIT_SECONDS` (how long to wait for the Command Line Tools).
 
 ## Install (Windows)
 
@@ -54,31 +78,37 @@ Environment overrides: `DOUGH_REPO` (release repo), `DOUGH_SKIP_LOGIN=1` (leave
 dough agent list
 ```
 
-On macOS you still sign in separately:
-
-```sh
-dough login --url https://app.usedough.ai
-```
-
 ## Tests
 
-The Windows installer's helpers have unit tests. They need PowerShell 7 and run on any
-platform (macOS included):
+Both installers' helpers have unit tests, and both suites run on macOS.
 
 ```sh
-pwsh -NoProfile -File test/install.Tests.ps1
+bash test/install.sh.tests.sh              # macOS installer
+pwsh -NoProfile -File test/install.Tests.ps1   # Windows installer (needs PowerShell 7)
 ```
 
-Lint and parse it too:
+Anything that depends on `PATH`, `HOME` or `SHELL` is probed in a **child process**
+(`test/probe.sh`), because a shell caches where it found a command and an in-process
+`PATH` flip can keep answering from that cache — quietly testing the machine instead
+of the fixture. Each such group carries a CONTROL that must come out the other way,
+so a broken fixture shows up as a failure rather than as a suite that passes for the
+wrong reason.
+
+Lint both, and the probe helper:
 
 ```sh
+shellcheck install.sh test/probe.sh
+shellcheck -s bash test/install.sh.tests.sh
 pwsh -NoProfile -Command 'Import-Module PSScriptAnalyzer; Invoke-ScriptAnalyzer -Path install.ps1 -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions'
 ```
 
-That should report **zero** findings. Two rules are excluded deliberately, and only two:
-`PSAvoidUsingWriteHost`, because this is an installer whose output is for a human watching
-a terminal, and `PSUseShouldProcessForStateChangingFunctions`, which fires on verb names
-alone and wants `-WhatIf` support that a bootstrap script has no caller for.
+All three should report **zero** findings. The suppressions are deliberate and
+individually justified in place: `SC2016` (single-quoted snippets are evaluated in the
+child, and profile lines must keep a literal `$PATH`) and `SC2069` (`2>&1 >/dev/null`
+keeps only stderr, on purpose) in the shell files; `PSAvoidUsingWriteHost`, because this
+is an installer whose output is for a human watching a terminal, and
+`PSUseShouldProcessForStateChangingFunctions`, which fires on verb names alone and wants
+`-WhatIf` support that a bootstrap script has no caller for.
 
 > Linux support is coming soon.
 
