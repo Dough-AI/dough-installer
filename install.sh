@@ -12,6 +12,7 @@
 #   DOUGH_BIN_DIR           install dir (default: /usr/local/bin, fallback ~/.local/bin)
 #   DOUGH_REPO              release repo (default: Dough-AI/dough-installer)
 #   DOUGH_SKIP_LOGIN        set to 1 to leave `dough login` to the user
+#   DOUGH_SKIP_GWS          set to 1 to skip the Google Workspace CLI
 #   DOUGH_SKIP_PROFILE      set to 1 to never edit a shell profile
 #   DOUGH_CLT_WAIT_SECONDS  how long to wait for the Command Line Tools (default: 1200)
 #
@@ -32,6 +33,8 @@ BIN_DIR=""
 DOUGH_BIN=""
 TMP_DOWNLOAD=""
 NEW_TERMINAL_NEEDED=0
+# "installed" | "present" | "skipped" | "failed" - read by the closing summary.
+GWS_STATUS="skipped"
 
 # --- output ----------------------------------------------------------------
 # Human-facing output goes to stderr, so stdout stays clean for anything piping
@@ -465,6 +468,108 @@ sign_in() {
 
 # --- done ------------------------------------------------------------------
 
+# --- Google Workspace CLI ---------------------------------------------------
+
+# Installs the `gws` binary only. It does NOT connect anything: no `gws auth`,
+# no call to Dough, and nothing written to ~/.config/gws.
+#
+# That boundary is deliberate. Connecting means a Google consent screen, and
+# every consent permanently consumes one of the OAuth app's 100 lifetime user
+# slots - a cap that cannot be reset. Spending slots at install time would burn
+# them on people who never open a spreadsheet. Connecting belongs to the
+# gws-connect skill, at the point someone actually needs a Sheet.
+#
+# Not touching ~/.config/gws also means this can never collide with an existing
+# gws install belonging to another tool.
+#
+# Failure here is NOT fatal: Google Workspace is an optional connector, and a
+# download problem must not take the rest of a working Dough setup with it.
+install_gws() {
+  step "Google Workspace CLI"
+
+  if [ "${DOUGH_SKIP_GWS:-}" = "1" ]; then
+    GWS_STATUS="skipped"
+    note "Skipped (DOUGH_SKIP_GWS=1)."
+    return 0
+  fi
+
+  # Already usable - including one installed by brew or anything else.
+  if existing=$(command -v gws 2>/dev/null) && [ -n "$("$existing" --version 2>/dev/null)" ]; then
+    GWS_STATUS="present"
+    good "Already installed at $existing"
+    return 0
+  fi
+
+  arch=$(uname -m)
+  case "$arch" in
+    arm64 | aarch64) gws_target="aarch64-apple-darwin" ;;
+    x86_64 | amd64) gws_target="x86_64-apple-darwin" ;;
+    *)
+      GWS_STATUS="failed"
+      note "Unsupported architecture for gws: $arch. Skipping."
+      return 0
+      ;;
+  esac
+
+  asset="google-workspace-cli-${gws_target}.tar.gz"
+  base="https://github.com/googleworkspace/cli/releases/latest/download"
+
+  gws_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/gws.XXXXXX")
+  if ! curl -fsSL "$base/$asset" -o "$gws_tmp_dir/$asset" ||
+     ! curl -fsSL "$base/$asset.sha256" -o "$gws_tmp_dir/$asset.sha256"; then
+    rm -rf "$gws_tmp_dir"
+    GWS_STATUS="failed"
+    note "Could not download $asset. Skipping - Dough itself is unaffected."
+    return 0
+  fi
+
+  # The .sha256 names the asset, but we compare hashes directly rather than
+  # using `shasum -c`, which would also insist the local filename match.
+  want=$(awk '{print $1}' "$gws_tmp_dir/$asset.sha256" 2>/dev/null)
+  got=$(shasum -a 256 "$gws_tmp_dir/$asset" 2>/dev/null | awk '{print $1}')
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    rm -rf "$gws_tmp_dir"
+    GWS_STATUS="failed"
+    note "Checksum mismatch for $asset. Skipping - nothing was installed."
+    return 0
+  fi
+
+  # The archive carries ./gws alongside its docs; take only the binary.
+  if ! tar -xzf "$gws_tmp_dir/$asset" -C "$gws_tmp_dir" ./gws 2>/dev/null; then
+    rm -rf "$gws_tmp_dir"
+    GWS_STATUS="failed"
+    note "Could not unpack $asset. Skipping."
+    return 0
+  fi
+  chmod 755 "$gws_tmp_dir/gws"
+
+  # Prove it runs before it is put anywhere. A non-empty version, not merely a
+  # zero exit: executing a ZERO-BYTE file succeeds, so an empty or truncated
+  # download would otherwise pass. Same reasoning as install_cli.
+  # `gws --version` prints a second line ("This is not an officially supported
+  # Google product."), so keep only the first or the summary line breaks apart.
+  gws_version=$("$gws_tmp_dir/gws" --version 2>/dev/null | head -n 1) || gws_version=""
+  if [ -z "$gws_version" ]; then
+    rm -rf "$gws_tmp_dir"
+    GWS_STATUS="failed"
+    note "The downloaded gws binary did not run. Skipping."
+    return 0
+  fi
+
+  # Guarded like every other failure path here: an unwritable or missing BIN_DIR
+  # must degrade to a note, not abort a working Dough setup for an optional
+  # connector. Without this the step returns mv's non-zero status and stops main.
+  if ! mv "$gws_tmp_dir/gws" "$BIN_DIR/gws" 2>/dev/null; then
+    rm -rf "$gws_tmp_dir"
+    GWS_STATUS="failed"
+    note "Could not place gws in $BIN_DIR. Skipping - Dough itself is unaffected."
+    return 0
+  fi
+  rm -rf "$gws_tmp_dir"
+  GWS_STATUS="installed"
+  good "Installed $gws_version to $BIN_DIR/gws"
+}
+
 summarise() {
   printf '\n%sDough is set up.%s\n\n' "$C_GREEN" "$C_RESET" >&2
   printf '%sOne thing left, and it matters:%s\n' "$C_YELLOW" "$C_RESET" >&2
@@ -472,6 +577,12 @@ summarise() {
   printf '%s  Closing the window is not enough - use Cmd+Q, or right-click the Dock icon and Quit.%s\n' \
     "$C_YELLOW" "$C_RESET" >&2
   printf '  Claude Code reads the plugin and hooks at startup, so a running app sees none of this.\n' >&2
+  if [ "$GWS_STATUS" = "installed" ] || [ "$GWS_STATUS" = "present" ]; then
+    printf '\n  The Google Workspace CLI (gws) is installed but %snot connected%s.\n' \
+      "$C_YELLOW" "$C_RESET" >&2
+    printf '  Nothing was shared with Google. To connect Sheets, Docs and Drive, ask\n' >&2
+    printf '  Claude Code to "connect Google Workspace" when you need it.\n' >&2
+  fi
   if [ "$NEW_TERMINAL_NEEDED" = "1" ]; then
     printf '\n  Open a new terminal before using the dough command. This installer runs in\n' >&2
     printf '  its own shell and cannot change the PATH of the window you started it from.\n' >&2
@@ -495,6 +606,7 @@ main() {
   ensure_prerequisites
   install_cli
   ensure_on_path
+  install_gws
   install_hooks
   install_plugin
   sign_in

@@ -540,6 +540,70 @@ function Invoke-DoughSetup {
   }
 
   # --- 7. Sign in -----------------------------------------------------------
+  # --- Google Workspace CLI -------------------------------------------------
+  # Installs the `gws` binary only. It does NOT connect anything: no `gws auth`,
+  # no call to Dough, and nothing written to ~/.config/gws.
+  #
+  # That boundary is deliberate. Connecting means a Google consent screen, and
+  # every consent permanently consumes one of the OAuth app's 100 lifetime user
+  # slots - a cap that cannot be reset. Spending slots at install time would burn
+  # them on people who never open a spreadsheet. Connecting belongs to the
+  # gws-connect skill, at the point someone actually needs a Sheet.
+  #
+  # Failure here is NOT fatal: Google Workspace is an optional connector, and a
+  # download problem must not take the rest of a working Dough setup with it.
+  Write-Step "Google Workspace CLI"
+  $gwsStatus = "skipped"
+  if ($env:DOUGH_SKIP_GWS -eq "1") {
+    Write-Note "Skipped (DOUGH_SKIP_GWS=1)."
+  } elseif (Get-Command gws -ErrorAction SilentlyContinue) {
+    $gwsStatus = "present"
+    Write-Good "Already installed at $((Get-Command gws).Source)"
+  } else {
+    $gwsTmp = Join-Path ([System.IO.Path]::GetTempPath()) "gws-$PID"
+    try {
+      $gwsAsset = "google-workspace-cli-x86_64-pc-windows-msvc.zip"
+      $gwsBase  = "https://github.com/googleworkspace/cli/releases/latest/download"
+      $gwsDir   = Join-Path $env:LOCALAPPDATA "dough\bin"
+      New-Item -ItemType Directory -Force -Path $gwsTmp | Out-Null
+      New-Item -ItemType Directory -Force -Path $gwsDir | Out-Null
+
+      $previousProgress = $ProgressPreference
+      $ProgressPreference = "SilentlyContinue"
+      try {
+        Invoke-WebRequest -Uri "$gwsBase/$gwsAsset" -OutFile (Join-Path $gwsTmp $gwsAsset)
+        Invoke-WebRequest -Uri "$gwsBase/$gwsAsset.sha256" -OutFile (Join-Path $gwsTmp "$gwsAsset.sha256")
+      } finally {
+        $ProgressPreference = $previousProgress
+      }
+
+      # The .sha256 names the asset; compare hashes directly rather than relying
+      # on a filename match.
+      $want = ((Get-Content (Join-Path $gwsTmp "$gwsAsset.sha256") -Raw).Trim() -split '\s+')[0]
+      $got  = (Get-FileHash (Join-Path $gwsTmp $gwsAsset) -Algorithm SHA256).Hash
+      if ($want -ne $got) { throw "checksum mismatch" }
+
+      Expand-Archive -Path (Join-Path $gwsTmp $gwsAsset) -DestinationPath $gwsTmp -Force
+      $gwsUnpacked = Get-ChildItem -Path $gwsTmp -Filter "gws.exe" -Recurse | Select-Object -First 1
+      if (-not $gwsUnpacked) { throw "gws.exe not found in $gwsAsset" }
+
+      # Prove it runs before it is put anywhere. A non-empty version, not merely a
+      # zero exit - the release is unsigned, so SmartScreen can block the first
+      # execution, and an empty or truncated download would otherwise pass.
+      $gwsProbe = & $gwsUnpacked.FullName --version 2>$null | Select-Object -First 1
+      if (-not $gwsProbe) { throw "the downloaded gws did not run" }
+
+      Move-Item -LiteralPath $gwsUnpacked.FullName -Destination (Join-Path $gwsDir "gws.exe") -Force
+      $gwsStatus = "installed"
+      Write-Good "Installed $gwsProbe to $(Join-Path $gwsDir 'gws.exe')"
+    } catch {
+      $gwsStatus = "failed"
+      Write-Note "Could not install gws ($($_.Exception.Message)). Skipping - Dough itself is unaffected."
+    } finally {
+      Remove-Item -LiteralPath $gwsTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
   Write-Step "Sign in"
   if ($env:DOUGH_SKIP_LOGIN -eq "1") {
     Write-Note "DOUGH_SKIP_LOGIN=1 - skipping. Run 'dough login' when you're ready."
@@ -581,6 +645,13 @@ function Invoke-DoughSetup {
   Write-Host "  Fully quit Claude Code and reopen it." -ForegroundColor Yellow
   Write-Host "  Closing the window is not enough - use Alt+F4, or quit it from the system tray." -ForegroundColor Yellow
   Write-Host "  Claude Code reads the plugin and hooks at startup, so a running app sees none of this."
+  Write-Host ""
+  if ($gwsStatus -eq "installed" -or $gwsStatus -eq "present") {
+    Write-Host ""
+    Write-Host "  The Google Workspace CLI (gws) is installed but not connected." -ForegroundColor Yellow
+    Write-Host "  Nothing was shared with Google. To connect Sheets, Docs and Drive, ask"
+    Write-Host "  Claude Code to ""connect Google Workspace"" when you need it."
+  }
   Write-Host ""
 }
 
