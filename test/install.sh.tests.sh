@@ -466,6 +466,64 @@ check "a failed login is reported" "rendered" \
 check "CONTROL: DOUGH_SKIP_LOGIN=1 does not even try" "0" \
   "$(status "DOUGH_BIN=$work/dough-login-fails; sign_in" DOUGH_SKIP_LOGIN=1)"
 
+
+# --- install_gws ------------------------------------------------------------
+# The step installs a binary and NOTHING else: no `gws auth`, no Dough call, no
+# ~/.config/gws. Connecting costs one of the OAuth app's 100 permanent user
+# slots, so it belongs to the skill, not to install time. These assert the
+# boundary as well as the mechanics.
+
+# A stand-in gws whose --version prints two lines, exactly as the real one does
+# ("gws 0.22.5" then "This is not an officially supported Google product.").
+fake_gws() { # fake_gws <path>
+  cat >"$1" <<'FAKEGWS'
+#!/bin/sh
+[ "$1" = "--version" ] || exit 1
+echo "gws 9.9.9"
+echo "This is not an officially supported Google product."
+FAKEGWS
+  chmod 755 "$1"
+}
+
+gws_bin="$work/gws-bin"
+mkdir -p "$gws_bin"
+fake_gws "$gws_bin/gws"
+
+check "an existing gws is left alone" "present" \
+  "$(run 'install_gws >/dev/null 2>&1; printf %s "$GWS_STATUS"' "PATH=$gws_bin:/usr/bin:/bin")"
+
+check "DOUGH_SKIP_GWS=1 skips it" "skipped" \
+  "$(run 'install_gws >/dev/null 2>&1; printf %s "$GWS_STATUS"' DOUGH_SKIP_GWS=1)"
+
+# CONTROL: without the skip and without a gws on PATH, it must NOT report
+# "skipped" - otherwise the assertion above would pass for the wrong reason.
+check "CONTROL: no gws and no skip does not report skipped" "not-skipped" \
+  "$(run 'BIN_DIR="$PWD/nowhere"; install_gws >/dev/null 2>&1; if [ "$GWS_STATUS" = skipped ]; then printf skipped; else printf not-skipped; fi' "PATH=/usr/bin:/bin")"
+
+# A download failure must leave the rest of setup intact: the step reports and
+# returns 0 rather than aborting a working install for an optional connector.
+check "a download failure is non-fatal" "0" \
+  "$(status 'BIN_DIR="$PWD/nowhere"; install_gws >/dev/null 2>&1' "PATH=/usr/bin:/bin")"
+
+# The whole point of the step's boundary: it must never reach for auth, and must
+# never touch the gws config dir. Comments are stripped first - the step's own
+# comments say what it must NOT do, and matching those would make this vacuous.
+gws_code="$work/gws-code.sh"
+sed -n '/^install_gws()/,/^}/p' "$DOUGH_TEST_LIB" | sed 's/#.*$//' >"$gws_code"
+
+check "CONTROL: the step body was actually extracted" "yes" \
+  "$([ -s "$gws_code" ] && printf yes || printf no)"
+
+check "the step never calls gws auth" "clean" \
+  "$(grep -qE 'gws[^\n]*auth|auth[^\n]*login|auth[^\n]*setup' "$gws_code" \
+     && printf dirty || printf clean)"
+
+check "the step never touches the gws config dir" "clean" \
+  "$(grep -q 'config/gws' "$gws_code" && printf dirty || printf clean)"
+
+check "the step never calls the Dough API" "clean" \
+  "$(grep -qE 'client-config|usedough' "$gws_code" && printf dirty || printf clean)"
+
 echo
 if [ "$fail" -eq 0 ]; then
   printf '%d passed, 0 failed\n\n' "$pass"
