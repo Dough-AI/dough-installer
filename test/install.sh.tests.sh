@@ -37,6 +37,9 @@ probe="$here/probe.sh"
 pass=0
 fail=0
 
+empty_probe_dir="$work/empty-probe"
+mkdir -p "$empty_probe_dir"
+
 check() { # check <name> <expected> <actual>
   if [ "$2" = "$3" ]; then
     printf '  ok   %s\n' "$1"
@@ -106,6 +109,46 @@ check "/usr/bin/git is the stub" "true" "$(boolean 'is_clt_stub /usr/bin/git')"
 check "Homebrew python3 is not" "false" "$(boolean 'is_clt_stub /opt/homebrew/bin/python3')"
 check "a tool inside the installed CLT is not" "false" \
   "$(boolean 'is_clt_stub /Library/Developer/CommandLineTools/usr/bin/git')"
+
+# --- clt_installed ----------------------------------------------------------
+# Every other check in this file STUBS this function, so until now the real one
+# was never asserted - and it is the hinge the whole prerequisite step turns on.
+# The case that matters most is a deleted CLT directory: `xcode-select -p` reads
+# a persisted link and can still print a path that is no longer there, which is
+# exactly the state `sudo rm -rf /Library/Developer/CommandLineTools` leaves
+# behind.
+echo
+echo "clt_installed - a path is not the same thing as a directory"
+xcs="$work/xcs"
+mkdir -p "$xcs"
+
+fake_xcode_select() { # fake_xcode_select <mode> [path]
+  case "$1" in
+    prints) printf '#!/bin/sh\ncase "$1" in --install) exit 0 ;; esac\necho %s\n' "$2" >"$xcs/xcode-select" ;;
+    fails) printf '#!/bin/sh\ncase "$1" in --install) exit 0 ;; esac\nexit 2\n' >"$xcs/xcode-select" ;;
+    empty) printf '#!/bin/sh\ncase "$1" in --install) exit 0 ;; esac\nexit 0\n' >"$xcs/xcode-select" ;;
+  esac
+  chmod +x "$xcs/xcode-select"
+}
+
+fake_xcode_select prints "$work"
+check "a path that exists means installed" "true" \
+  "$(TEST_PATH="$xcs:/usr/bin:/bin" boolean clt_installed)"
+
+fake_xcode_select prints "$work/deleted-by-rm-rf"
+check "a path that no longer exists does NOT" "false" \
+  "$(TEST_PATH="$xcs:/usr/bin:/bin" boolean clt_installed)"
+
+fake_xcode_select fails
+check "xcode-select failing does NOT" "false" \
+  "$(TEST_PATH="$xcs:/usr/bin:/bin" boolean clt_installed)"
+
+fake_xcode_select empty
+check "xcode-select printing nothing does NOT" "false" \
+  "$(TEST_PATH="$xcs:/usr/bin:/bin" boolean clt_installed)"
+
+check "CONTROL: no xcode-select on PATH at all does NOT" "false" \
+  "$(TEST_PATH="$empty_probe_dir" boolean clt_installed)"
 
 # --- the guard: never execute the stub --------------------------------------
 # The consequence of getting this wrong is a GUI dialog on a client's machine,
@@ -358,6 +401,21 @@ check "CLT present but python3 broken names python3" "rendered" \
   "$(renders "but python3 is still not usable" \
     'clt_installed() { return 0; }; python3_ready() { return 1; }; git_ready() { return 0; }
      ensure_prerequisites')"
+
+# Which of the two prerequisite branches gets taken turns entirely on
+# clt_installed, and they need opposite remedies: one waits out an Apple
+# download, the other says that download would not have helped. Same broken
+# tools in both, so only clt_installed can be deciding.
+fake_xcode_select fails
+check "CLT absent means TRIGGER the install and wait" "rendered" \
+  "$(TEST_PATH="$xcs:/usr/bin:/bin" renders "did not finish within 0s" \
+    'python3_ready() { return 1; }; git_ready() { return 1; }; ensure_prerequisites' \
+    "DOUGH_CLT_WAIT_SECONDS=0")"
+fake_xcode_select prints "$work"
+check "CONTROL: CLT present means DON'T - say what is shadowing it" "rendered" \
+  "$(TEST_PATH="$xcs:/usr/bin:/bin" renders "still not usable" \
+    'python3_ready() { return 1; }; git_ready() { return 1; }; ensure_prerequisites' \
+    "DOUGH_CLT_WAIT_SECONDS=0")"
 
 check "waiting for the CLT eventually gives up" "rendered" \
   "$(renders "did not finish within 0s" \
