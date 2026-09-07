@@ -23,9 +23,18 @@ jobs:
 
   powershell:
     name: PowerShell lint and tests
-    runs-on: windows-latest
+    # Runs on Linux, not Windows, because test/install.Tests.ps1 is written for
+    # PowerShell Core on a Unix host: it shells out to `chmod` and asserts that
+    # `python` resolves on PATH. Both fail on windows-latest.
+    #
+    # KNOWN GAP: install.ps1 targets Windows, so its tests have never executed
+    # on the platform it ships to. Making them Windows-capable is tracked
+    # separately; running them here is strictly better than not running them.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
