@@ -1,0 +1,39 @@
+# CI for the public install path. A defect here breaks every new user's
+# first command, and until now nothing ran against it automatically —
+# the tests in test/ existed but were never executed by CI.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  shell:
+    name: Shell lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck -S error install.sh test/*.sh
+      - name: Run shell tests
+        run: bash test/install.sh.tests.sh
+
+  powershell:
+    name: PowerShell lint and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Error
+          if ($r) { $r | Format-Table; exit 1 }
+      - name: Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+          Invoke-Pester test/install.Tests.ps1 -CI
