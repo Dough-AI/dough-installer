@@ -184,40 +184,82 @@ Check "rejects a python that exits 0 but prints nothing" {
 Remove-Item -Recurse -Force $shimDir, $fakeHome, $emptyDir -ErrorAction SilentlyContinue
 
 # --- Install-Dependency ------------------------------------------------------
-# winget does not exist on this machine, which makes the failure path directly
-# testable: the winget call throws, is caught, and the re-probe decides.
+# Invoke-WebRequest and Start-Process are shadowed by functions (which take
+# precedence over cmdlets), so the download, checksum and install path runs
+# for real against a local file, with no network and nothing installed.
 Write-Host "`nInstall-Dependency" -ForegroundColor Cyan
 
-Check "returns without running winget when the probe already passes" {
+$fakePayload = Join-Path ([System.IO.Path]::GetTempPath()) "dough-payload-$PID.exe"
+Set-Content -LiteralPath $fakePayload -Value "not really an installer" -NoNewline
+$fakeInstaller = @{
+  Url       = "https://example.invalid/fake-setup.exe"
+  Sha256    = (Get-FileHash -LiteralPath $fakePayload -Algorithm SHA256).Hash
+  Arguments = @("/quiet", "PrependPath=1")
+}
+$script:Downloads = 0
+$script:Runs = @()
+$script:InstallerExit = 0
+function Invoke-WebRequest {
+  param([string]$Uri, [string]$OutFile)
+  $script:Downloads++
+  Copy-Item -LiteralPath $fakePayload -Destination $OutFile -Force
+}
+function Start-Process {
+  param([string]$FilePath, [string[]]$ArgumentList, [switch]$Wait, [switch]$PassThru)
+  $script:Runs += , @{ File = $FilePath; Arguments = $ArgumentList; Existed = (Test-Path -LiteralPath $FilePath) }
+  [pscustomobject]@{ ExitCode = $script:InstallerExit }
+}
+function Reset-Fake { $script:Downloads = 0; $script:Runs = @(); $script:InstallerExit = 0 }
+
+Check "downloads nothing when the probe already passes" {
+  Reset-Fake
   $script:FixWasEvaluated = $false
-  Install-Dependency -Name "Fake" -WingetId "No.Such.Package" `
+  Install-Dependency -Name "Fake" -Installer $fakeInstaller `
     -Probe { $true } `
     -Fix { $script:FixWasEvaluated = $true; @("should not appear") } | Out-Null
   # Lazily evaluating -Fix is what stops the Python remediation from blaming the
   # Store stub on a machine where the stub is merely present, not the cause.
-  $script:FixWasEvaluated -eq $false
+  $script:Downloads -eq 0 -and $script:Runs.Count -eq 0 -and $script:FixWasEvaluated -eq $false
 }
 
-Check "throws with the -Fix lines when the probe never passes" {
-  $threw = $null
-  try {
-    Install-Dependency -Name "Fake" -WingetId "No.Such.Package" `
-      -Probe { $false } `
-      -Fix { @("do the specific thing") } | Out-Null
-  } catch {
-    $threw = $_.Exception.Message
-  }
-  $null -ne $threw -and $threw.Contains("do the specific thing") -and $threw.Contains("Fake is still not usable")
+Check "runs the verified installer with its switches, then succeeds on the re-probe" {
+  Reset-Fake
+  $script:ProbeCalls = 0
+  Install-Dependency -Name "Fake" -Installer $fakeInstaller `
+    -Probe { $script:ProbeCalls++; $script:ProbeCalls -gt 1 } `
+    -Fix { @("x") } | Out-Null
+  $run = $script:Runs[0]
+  $script:Runs.Count -eq 1 -and $run.Existed -and
+    (($run.Arguments -join " ") -eq "/quiet PrependPath=1") -and
+    -not (Test-Path -LiteralPath $run.File)
 }
 
-Check "carries a winget diagnostic into the failure message" {
+Check "never runs an installer whose checksum does not match" {
+  Reset-Fake
+  $tampered = $fakeInstaller.Clone()
+  $tampered.Sha256 = "0" * 64
   $threw = $null
   try {
-    Install-Dependency -Name "Fake" -WingetId "No.Such.Package" -Probe { $false } -Fix { @("x") } | Out-Null
+    Install-Dependency -Name "Fake" -Installer $tampered -Probe { $false } -Fix { @("do the specific thing") } | Out-Null
   } catch { $threw = $_.Exception.Message }
-  # Either an exit code or the "could not be run" branch, never an empty slot.
-  $threw -match "exit code|could not be run"
+  $leftovers = @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter "dough-$PID-fake-setup.exe" -ErrorAction SilentlyContinue)
+  $script:Downloads -eq 1 -and $script:Runs.Count -eq 0 -and $leftovers.Count -eq 0 -and
+    $threw.Contains("checksum mismatch") -and $threw.Contains("do the specific thing")
 }
+
+Check "throws with the exit code and -Fix lines when the probe never passes" {
+  Reset-Fake
+  $script:InstallerExit = 1603
+  $threw = $null
+  try {
+    Install-Dependency -Name "Fake" -Installer $fakeInstaller -Probe { $false } -Fix { @("do the specific thing") } | Out-Null
+  } catch { $threw = $_.Exception.Message }
+  $null -ne $threw -and $threw.Contains("Fake is still not usable after running fake-setup.exe (exit code 1603)") -and
+    $threw.Contains("do the specific thing")
+}
+
+Remove-Item -Path Function:\Invoke-WebRequest, Function:\Start-Process
+Remove-Item -LiteralPath $fakePayload -Force -ErrorAction SilentlyContinue
 
 # --- Set-ClaudeEnvSetting ----------------------------------------------------
 # This rewrites the file that holds the Dough hooks, so the thing under test is
