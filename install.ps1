@@ -26,15 +26,18 @@ $InstallerUrl = "https://raw.githubusercontent.com/$DoughRepo/main/install.ps1"
 # missing on Windows Server, LTSC and some fresh profiles, and all it did was
 # run these same installers. PATH is set by the installers themselves (the
 # switches below), and Get-RefreshedPath picks it up in this session.
+# To bump one, change Url and Sha256 together (Get-FileHash on the download).
+# Both are x64, like dough-windows-x64.exe; Windows on ARM runs them emulated.
 #
 # Python must be a 3.x: the Claude Code hooks this script registers are Python,
 # and the CLI writes `python` (not `python3`) into them. Both are per-user, so
-# neither needs admin.
+# neither needs admin. (Run elevated, Git also writes the machine PATH.)
 $PythonInstaller = @{
   Url       = "https://www.python.org/ftp/python/3.13.15/python-3.13.15-amd64.exe"
   Sha256    = "EDEC09C4853AEAE9AC36EFB8C9F95B6B8E2FEE65EEE56D9767A8B7C69C574403"
-  # PrependPath=1 puts python.exe and Scripts\ on the user PATH.
-  Arguments = @("/quiet", "InstallAllUsers=0", "PrependPath=1", "Include_test=0")
+  # PrependPath=1 puts python.exe and Scripts\ on the user PATH. The py launcher
+  # defaults to all-users (admin) even with InstallAllUsers=0.
+  Arguments = @("/quiet", "InstallAllUsers=0", "InstallLauncherAllUsers=0", "PrependPath=1", "Include_test=0")
 }
 $GitInstaller = @{
   Url       = "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/Git-2.56.0.2-64-bit.exe"
@@ -175,16 +178,18 @@ function Save-VerifiedInstaller {
   $previousProgress = $ProgressPreference
   $ProgressPreference = "SilentlyContinue"
   try {
-    Invoke-WebRequest -Uri $Url -OutFile $file
-  } finally {
-    $ProgressPreference = $previousProgress
-  }
-  $got = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
-  if ($got -ne $Sha256) {
+    try {
+      Invoke-WebRequest -Uri $Url -OutFile $file
+    } finally {
+      $ProgressPreference = $previousProgress
+    }
+    $got = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+    if ($got -ne $Sha256) { throw "checksum mismatch for $leaf (expected $Sha256, got $got)" }
+    return $file
+  } catch {
     Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
-    throw "checksum mismatch for $leaf (expected $Sha256, got $got)"
+    throw
   }
-  return $file
 }
 
 # Install a dependency and verify it by RE-PROBING, not by trusting the
@@ -212,12 +217,18 @@ function Install-Dependency {
   $file = $null
   try {
     $file = Save-VerifiedInstaller -Url $Installer.Url -Sha256 $Installer.Sha256
-    $process = Start-Process -FilePath $file -ArgumentList $Installer.Arguments -Wait -PassThru
-    $outcome = "exit code $($process.ExitCode)"
   } catch {
-    $outcome = "the installer could not be run: $($_.Exception.Message)"
-  } finally {
-    if ($file) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+    $outcome = "download failed: $($_.Exception.Message)"
+  }
+  if ($file) {
+    try {
+      $process = Start-Process -FilePath $file -ArgumentList $Installer.Arguments -Wait -PassThru
+      $outcome = "exit code $($process.ExitCode)"
+    } catch {
+      $outcome = "the installer could not be started: $($_.Exception.Message)"
+    } finally {
+      Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
   }
 
   $env:Path = Get-RefreshedPath
@@ -227,7 +238,7 @@ function Install-Dependency {
     return
   }
 
-  throw (Format-SetupError "$Name is still not usable after running $leaf ($outcome)." (& $Fix))
+  throw (Format-SetupError "$Name is still not usable after trying to install $leaf ($outcome)." (& $Fix))
 }
 
 # Reads the dispatcher path back out of the hook the CLI registered. Mirrors the

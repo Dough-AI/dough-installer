@@ -59,7 +59,8 @@ This is the whole setup, not just the binary. In order it:
 
 Python and Git come from their official installers (python.org and the Git for Windows
 GitHub release), pinned by version and SHA256 and installed for the current user, so
-neither needs winget or admin rights. Each is skipped if it's already present.
+neither needs winget or admin rights. (From an elevated prompt, Git also adds itself to
+the machine PATH.) Each is skipped if it's already present.
 
 It's safe to re-run: every step checks before it acts, so re-running is also how you
 update the CLI and the plugin. It stops at the first thing it can't fix and tells you

@@ -199,17 +199,25 @@ $fakeInstaller = @{
 $script:Downloads = 0
 $script:Runs = @()
 $script:InstallerExit = 0
+$script:DownloadDropsMidway = $false
 function Invoke-WebRequest {
   param([string]$Uri, [string]$OutFile)
   $script:Downloads++
   Copy-Item -LiteralPath $fakePayload -Destination $OutFile -Force
+  if ($script:DownloadDropsMidway) { throw "connection reset" }
 }
 function Start-Process {
   param([string]$FilePath, [string[]]$ArgumentList, [switch]$Wait, [switch]$PassThru)
-  $script:Runs += , @{ File = $FilePath; Arguments = $ArgumentList; Existed = (Test-Path -LiteralPath $FilePath) }
+  $script:Runs += , @{
+    File = $FilePath; Arguments = $ArgumentList; Existed = (Test-Path -LiteralPath $FilePath)
+    Waited = ($Wait.IsPresent -and $PassThru.IsPresent)
+  }
   [pscustomobject]@{ ExitCode = $script:InstallerExit }
 }
-function Reset-Fake { $script:Downloads = 0; $script:Runs = @(); $script:InstallerExit = 0 }
+function Reset-Fake { $script:Downloads = 0; $script:Runs = @(); $script:InstallerExit = 0; $script:DownloadDropsMidway = $false }
+function Get-FakeLeftover {
+  @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter "dough-$PID-fake-setup.exe" -ErrorAction SilentlyContinue)
+}
 
 Check "downloads nothing when the probe already passes" {
   Reset-Fake
@@ -229,7 +237,8 @@ Check "runs the verified installer with its switches, then succeeds on the re-pr
     -Probe { $script:ProbeCalls++; $script:ProbeCalls -gt 1 } `
     -Fix { @("x") } | Out-Null
   $run = $script:Runs[0]
-  $script:Runs.Count -eq 1 -and $run.Existed -and
+  # -Wait matters: without it the re-probe races the installer.
+  $script:Runs.Count -eq 1 -and $run.Existed -and $run.Waited -and
     (($run.Arguments -join " ") -eq "/quiet PrependPath=1") -and
     -not (Test-Path -LiteralPath $run.File)
 }
@@ -242,9 +251,19 @@ Check "never runs an installer whose checksum does not match" {
   try {
     Install-Dependency -Name "Fake" -Installer $tampered -Probe { $false } -Fix { @("do the specific thing") } | Out-Null
   } catch { $threw = $_.Exception.Message }
-  $leftovers = @(Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Filter "dough-$PID-fake-setup.exe" -ErrorAction SilentlyContinue)
-  $script:Downloads -eq 1 -and $script:Runs.Count -eq 0 -and $leftovers.Count -eq 0 -and
+  $script:Downloads -eq 1 -and $script:Runs.Count -eq 0 -and (Get-FakeLeftover).Count -eq 0 -and
     $threw.Contains("checksum mismatch") -and $threw.Contains("do the specific thing")
+}
+
+Check "a download that dies midway leaves no file, runs nothing, and says so" {
+  Reset-Fake
+  $script:DownloadDropsMidway = $true
+  $threw = $null
+  try {
+    Install-Dependency -Name "Fake" -Installer $fakeInstaller -Probe { $false } -Fix { @("do the specific thing") } | Out-Null
+  } catch { $threw = $_.Exception.Message }
+  $script:Runs.Count -eq 0 -and (Get-FakeLeftover).Count -eq 0 -and
+    $threw.Contains("(download failed: connection reset)") -and $threw.Contains("do the specific thing")
 }
 
 Check "throws with the exit code and -Fix lines when the probe never passes" {
@@ -254,12 +273,42 @@ Check "throws with the exit code and -Fix lines when the probe never passes" {
   try {
     Install-Dependency -Name "Fake" -Installer $fakeInstaller -Probe { $false } -Fix { @("do the specific thing") } | Out-Null
   } catch { $threw = $_.Exception.Message }
-  $null -ne $threw -and $threw.Contains("Fake is still not usable after running fake-setup.exe (exit code 1603)") -and
+  $null -ne $threw -and $threw.Contains("Fake is still not usable after trying to install fake-setup.exe (exit code 1603)") -and
     $threw.Contains("do the specific thing")
 }
 
 Remove-Item -Path Function:\Invoke-WebRequest, Function:\Start-Process
 Remove-Item -LiteralPath $fakePayload -Force -ErrorAction SilentlyContinue
+
+# --- $PythonInstaller / $GitInstaller ----------------------------------------
+# The real pins, evaluated from the AST with a LOCALAPPDATA that has a space in it.
+Write-Host "`nPinned installers" -ForegroundColor Cyan
+$savedLocalAppData = $env:LOCALAPPDATA
+# Join-Path needs a drive that exists here, so root it in TEMP.
+$spacedLocalAppData = Join-Path ([System.IO.Path]::GetTempPath()) 'A B'
+$env:LOCALAPPDATA = $spacedLocalAppData
+foreach ($assignment in $ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $args[0].Left.Extent.Text -in @('$PythonInstaller', '$GitInstaller')
+  }, $false)) {
+  Invoke-Expression $assignment.Extent.Text
+}
+$env:LOCALAPPDATA = $savedLocalAppData
+
+Check "both pins are an https URL and a 64-hex SHA256" {
+  @($PythonInstaller, $GitInstaller | Where-Object {
+      $_.Url -like "https://*" -and $_.Sha256 -cmatch '^[0-9A-F]{64}$'
+    }).Count -eq 2
+}
+Check "Python installs per-user (launcher too) and onto PATH" {
+  $a = $PythonInstaller.Arguments
+  ($a -contains "InstallAllUsers=0") -and ($a -contains "InstallLauncherAllUsers=0") -and ($a -contains "PrependPath=1")
+}
+Check "Git /DIR is one quoted argument under LOCALAPPDATA, even with a space" {
+  $dir = @($GitInstaller.Arguments | Where-Object { $_ -like "/DIR=*" })
+  $dir.Count -eq 1 -and $dir[0].StartsWith('/DIR="' + $spacedLocalAppData) -and $dir[0].EndsWith('Git"') -and
+    ($GitInstaller.Arguments -contains "/o:PathOption=Cmd")
+}
 
 # --- Set-ClaudeEnvSetting ----------------------------------------------------
 # This rewrites the file that holds the Dough hooks, so the thing under test is
