@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 # Make native-command failures behave the same on Windows PowerShell 5.1 and
 # PowerShell 7.4+. In 7.4+ this defaults to $true, which turns any nonzero exit
 # code into a thrown error under `$ErrorActionPreference = "Stop"` - so the same
-# script would report winget/dough failures through a raw .NET message on one
+# script would report installer/dough failures through a raw .NET message on one
 # host and through our own guidance on the other. Every external call below
 # checks $LASTEXITCODE explicitly, so opt out and keep one behaviour.
 $PSNativeCommandUseErrorActionPreference = $false
@@ -22,10 +22,33 @@ $PSNativeCommandUseErrorActionPreference = $false
 $DoughRepo    = if ($env:DOUGH_REPO) { $env:DOUGH_REPO } else { "Dough-AI/dough-installer" }
 $InstallerUrl = "https://raw.githubusercontent.com/$DoughRepo/main/install.ps1"
 
-# Winget package ids. Python must be a 3.x: the Claude Code hooks this script
-# registers are Python, and the CLI writes `python` (not `python3`) into them.
-$PythonWingetId = "Python.Python.3.13"
-$GitWingetId    = "Git.Git"
+# The vendors' own installers, pinned by version and SHA256. No winget: it is
+# missing on Windows Server, LTSC and some fresh profiles, and all it did was
+# run these same installers. PATH is set by the installers themselves (the
+# switches below), and Get-RefreshedPath picks it up in this session.
+# To bump one, change Url and Sha256 together (Get-FileHash on the download).
+# Both are x64, like dough-windows-x64.exe; Windows on ARM runs them emulated.
+#
+# Python must be a 3.x: the Claude Code hooks this script registers are Python,
+# and the CLI writes `python` (not `python3`) into them. Both are per-user, so
+# neither needs admin. (Run elevated, Git also writes the machine PATH.)
+$PythonInstaller = @{
+  Url       = "https://www.python.org/ftp/python/3.13.15/python-3.13.15-amd64.exe"
+  Sha256    = "EDEC09C4853AEAE9AC36EFB8C9F95B6B8E2FEE65EEE56D9767A8B7C69C574403"
+  # PrependPath=1 puts python.exe and Scripts\ on the user PATH. The py launcher
+  # defaults to all-users (admin) even with InstallAllUsers=0.
+  Arguments = @("/quiet", "InstallAllUsers=0", "InstallLauncherAllUsers=0", "PrependPath=1", "Include_test=0")
+}
+$GitInstaller = @{
+  Url       = "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/Git-2.56.0.2-64-bit.exe"
+  Sha256    = "52188F917B378F00C70EC136BCF090005F30D44FBC4EBA0BCE759CC6592D60F6"
+  # PathOption=Cmd puts Git\cmd on PATH. /DIR is one of the locations
+  # Get-GitBashPath checks; the default (Program Files) would need admin.
+  Arguments = @(
+    "/VERYSILENT", "/NORESTART", "/SP-", "/SUPPRESSMSGBOXES", "/o:PathOption=Cmd",
+    "/DIR=`"$(Join-Path "$env:LOCALAPPDATA" 'Programs\Git')`""
+  )
+}
 
 function Write-Step { param([string]$Message) Write-Host ""; Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Good { param([string]$Message) Write-Host "    $Message" -ForegroundColor Green }
@@ -45,8 +68,8 @@ function Format-SetupError {
   return ($lines -join [Environment]::NewLine)
 }
 
-# Returns what $env:Path should be after an installer has run. winget writes its
-# PATH changes to the registry; an already-running process keeps its own copy,
+# Returns what $env:Path should be after an installer has run. Installers write
+# their PATH changes to the registry; an already-running process keeps its own copy,
 # which is why "you might have to restart PowerShell" is the usual advice.
 # Assigning this result is what makes a just-installed python/git visible in THIS
 # session instead.
@@ -135,7 +158,7 @@ function Test-GitReady {
 }
 
 # The Store stub above can also SHADOW a real Python install when it sits
-# earlier on PATH, which turns a successful winget run into a still-failing
+# earlier on PATH, which turns a successful install into a still-failing
 # probe. Detected only to make that failure legible - and evaluated at failure
 # time, never up front, because on a machine with no Python at all the stub is
 # always present and would otherwise be blamed for every failure.
@@ -145,16 +168,39 @@ function Get-PythonStoreStub {
   return $null
 }
 
-# Install a dependency and verify it by RE-PROBING, not by trusting winget's
-# exit code. Two reasons: winget reports a nonzero "already installed" for a
-# package that is present but missing from PATH, which is a case we recover from
-# rather than fail on; and the thing that matters is whether the command works
-# afterwards, not whether the installer claimed success. winget's exit code is
-# still carried into the error message as a diagnostic.
+# Downloads an installer to a temp file and checks it against its pinned
+# SHA256 before anything runs it. Returns the file path; the caller deletes it.
+function Save-VerifiedInstaller {
+  param([string]$Url, [string]$Sha256)
+  $leaf = Split-Path -Leaf $Url
+  $file = Join-Path ([System.IO.Path]::GetTempPath()) "dough-$PID-$leaf"
+  # See the dough.exe download: the progress bar costs minutes on PowerShell 5.1.
+  $previousProgress = $ProgressPreference
+  $ProgressPreference = "SilentlyContinue"
+  try {
+    try {
+      Invoke-WebRequest -Uri $Url -OutFile $file
+    } finally {
+      $ProgressPreference = $previousProgress
+    }
+    $got = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+    if ($got -ne $Sha256) { throw "checksum mismatch for $leaf (expected $Sha256, got $got)" }
+    return $file
+  } catch {
+    Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
+
+# Install a dependency and verify it by RE-PROBING, not by trusting the
+# installer's exit code: what matters is whether the command works afterwards
+# (e.g. an already-installed Python that is merely missing from PATH exits 0
+# and still fails the probe). The exit code is carried into the error message
+# as a diagnostic.
 function Install-Dependency {
   param(
     [string]$Name,
-    [string]$WingetId,
+    [hashtable]$Installer,
     [scriptblock]$Probe,
     [scriptblock]$Fix
   )
@@ -165,13 +211,24 @@ function Install-Dependency {
     return
   }
 
-  Write-Note "Not found. Installing $WingetId via winget (this can take a few minutes)..."
-  $wingetExit = $null
+  $leaf = Split-Path -Leaf $Installer.Url
+  Write-Note "Not found. Downloading and running $leaf (this can take a few minutes)..."
+  $outcome = $null
+  $file = $null
   try {
-    & winget install -e --id $WingetId --accept-package-agreements --accept-source-agreements
-    $wingetExit = "exit code $LASTEXITCODE"
+    $file = Save-VerifiedInstaller -Url $Installer.Url -Sha256 $Installer.Sha256
   } catch {
-    $wingetExit = "winget could not be run: $($_.Exception.Message)"
+    $outcome = "download failed: $($_.Exception.Message)"
+  }
+  if ($file) {
+    try {
+      $process = Start-Process -FilePath $file -ArgumentList $Installer.Arguments -Wait -PassThru
+      $outcome = "exit code $($process.ExitCode)"
+    } catch {
+      $outcome = "the installer could not be started: $($_.Exception.Message)"
+    } finally {
+      Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
   }
 
   $env:Path = Get-RefreshedPath
@@ -181,7 +238,7 @@ function Install-Dependency {
     return
   }
 
-  throw (Format-SetupError "$Name is still not usable after installing $WingetId ($wingetExit)." (& $Fix))
+  throw (Format-SetupError "$Name is still not usable after trying to install $leaf ($outcome)." (& $Fix))
 }
 
 # Reads the dispatcher path back out of the hook the CLI registered. Mirrors the
@@ -309,29 +366,11 @@ function Invoke-DoughSetup {
   Write-Host "Dough setup for Windows" -ForegroundColor White
   Write-Host "Installing Python, Git, the dough CLI, the Claude Code plugin, and signing you in."
 
-  # --- 0. winget ------------------------------------------------------------
-  # Everything below depends on it, so an absent winget is worth failing on
-  # before anything has been written to the machine.
-  Write-Step "Checking prerequisites"
-  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    throw (Format-SetupError `
-      "winget (the Windows Package Manager) is not available, so Python and Git cannot be installed automatically." `
-      @(
-        "Install 'App Installer' from the Microsoft Store, then re-run this command:",
-        "  https://apps.microsoft.com/detail/9NBLGGH4NNS1",
-        "",
-        "Or install both dependencies by hand and re-run:",
-        "  Python 3  https://www.python.org/downloads/windows/  (tick 'Add python.exe to PATH')",
-        "  Git       https://git-scm.com/download/win"
-      ))
-  }
-  Write-Good "winget is available."
-
   # --- 1. Python ------------------------------------------------------------
   # Claude Code runs the Dough hooks with 'python'. Without it every session
   # fires a broken hook, which surfaces later as confusing tool failures rather
   # than as a missing dependency - so it is a hard requirement here.
-  Install-Dependency -Name "Python 3" -WingetId $PythonWingetId -Probe ${function:Test-PythonReady} -Fix {
+  Install-Dependency -Name "Python 3" -Installer $PythonInstaller -Probe ${function:Test-PythonReady} -Fix {
     $lines = @()
     $stub = Get-PythonStoreStub
     if ($stub) {
@@ -355,7 +394,7 @@ function Invoke-DoughSetup {
   # Windows is required to run local sessions." The probe therefore requires
   # bash.exe, not just `git` on PATH - a git without it satisfies `git --version`
   # and still leaves the app blocked.
-  Install-Dependency -Name "Git for Windows" -WingetId $GitWingetId -Probe ${function:Test-GitReady} -Fix {
+  Install-Dependency -Name "Git for Windows" -Installer $GitInstaller -Probe ${function:Test-GitReady} -Fix {
     @(
       "Install Git for Windows - not another git build; the Claude Code desktop app",
       "needs the Git Bash that ships with it (bash.exe):",
