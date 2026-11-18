@@ -591,6 +591,11 @@ function Invoke-DoughSetup {
   #
   # Failure here is NOT fatal: Google Workspace is an optional connector, and a
   # download problem must not take the rest of a working Dough setup with it.
+  # gws and uv are optional, so a dead connection gives up after 10 minutes rather
+  # than hanging setup. Not applied to Python, Git or the CLI: in PowerShell 7
+  # -TimeoutSec caps the whole download, and those are large and required.
+  $optionalDownloadTimeout = 600
+
   Write-Step "Google Workspace CLI"
   $gwsStatus = "skipped"
   if ($env:DOUGH_SKIP_GWS -eq "1") {
@@ -610,8 +615,8 @@ function Invoke-DoughSetup {
       $previousProgress = $ProgressPreference
       $ProgressPreference = "SilentlyContinue"
       try {
-        Invoke-WebRequest -Uri "$gwsBase/$gwsAsset" -OutFile (Join-Path $gwsTmp $gwsAsset)
-        Invoke-WebRequest -Uri "$gwsBase/$gwsAsset.sha256" -OutFile (Join-Path $gwsTmp "$gwsAsset.sha256")
+        Invoke-WebRequest -TimeoutSec $optionalDownloadTimeout -Uri "$gwsBase/$gwsAsset" -OutFile (Join-Path $gwsTmp $gwsAsset)
+        Invoke-WebRequest -TimeoutSec $optionalDownloadTimeout -Uri "$gwsBase/$gwsAsset.sha256" -OutFile (Join-Path $gwsTmp "$gwsAsset.sha256")
       } finally {
         $ProgressPreference = $previousProgress
       }
@@ -640,6 +645,71 @@ function Invoke-DoughSetup {
       Write-Note "Could not install gws ($($_.Exception.Message)). Skipping - Dough itself is unaffected."
     } finally {
       Remove-Item -LiteralPath $gwsTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  # --- uv -----------------------------------------------------------------
+  # uv (with uvx and uvw), the Python tool runner Agent Factory runs its scripts
+  # with: `uv run --with ... script.py`. Only the binaries, into the same folder as
+  # dough.exe and gws.exe: no PATH or profile edits of its own and no remote install
+  # script. The Agent Factory skill itself is NOT installed here - it is enabled for
+  # selected people only, and they fetch it with `dough skill sync @dough/agent-factory`.
+  #
+  # Failure here is NOT fatal: only Agent Factory needs uv.
+  Write-Step "uv (Python tool runner)"
+  $uvStatus = "skipped"
+  if ($env:DOUGH_SKIP_UV -eq "1") {
+    Write-Note "Skipped (DOUGH_SKIP_UV=1)."
+  } elseif (Get-Command uv -ErrorAction SilentlyContinue) {
+    $uvStatus = "present"
+    Write-Good "Already installed at $((Get-Command uv).Source)"
+  } else {
+    $uvTmp = Join-Path ([System.IO.Path]::GetTempPath()) "uv-$PID"
+    try {
+      $uvTarget = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+      $uvAsset  = "uv-$uvTarget.zip"
+      $uvBase   = "https://github.com/astral-sh/uv/releases/latest/download"
+      $uvDir    = Join-Path $env:LOCALAPPDATA "dough\bin"
+      New-Item -ItemType Directory -Force -Path $uvTmp | Out-Null
+      New-Item -ItemType Directory -Force -Path $uvDir | Out-Null
+
+      $previousProgress = $ProgressPreference
+      $ProgressPreference = "SilentlyContinue"
+      try {
+        Invoke-WebRequest -TimeoutSec $optionalDownloadTimeout -Uri "$uvBase/$uvAsset" -OutFile (Join-Path $uvTmp $uvAsset)
+        Invoke-WebRequest -TimeoutSec $optionalDownloadTimeout -Uri "$uvBase/$uvAsset.sha256" -OutFile (Join-Path $uvTmp "$uvAsset.sha256")
+      } finally {
+        $ProgressPreference = $previousProgress
+      }
+
+      # Hashes compared directly, as for gws.
+      $want = ((Get-Content (Join-Path $uvTmp "$uvAsset.sha256") -Raw).Trim() -split '\s+')[0]
+      $got  = (Get-FileHash (Join-Path $uvTmp $uvAsset) -Algorithm SHA256).Hash
+      if ($want -ne $got) { throw "checksum mismatch" }
+
+      # The zip holds uv.exe, uvx.exe and uvw.exe at its root.
+      Expand-Archive -Path (Join-Path $uvTmp $uvAsset) -DestinationPath $uvTmp -Force
+      $uvUnpacked = Join-Path $uvTmp "uv.exe"
+      if (-not (Test-Path -LiteralPath $uvUnpacked)) { throw "uv.exe not found in $uvAsset" }
+
+      # Prove it runs before it is put anywhere: a non-empty version, not merely a
+      # zero exit (an empty or truncated download would otherwise pass).
+      $uvProbe = & $uvUnpacked --version 2>$null | Select-Object -First 1
+      if (-not $uvProbe) { throw "the downloaded uv did not run" }
+
+      foreach ($uvExe in @("uv.exe", "uvx.exe", "uvw.exe")) {
+        $uvFrom = Join-Path $uvTmp $uvExe
+        if (Test-Path -LiteralPath $uvFrom) {
+          Move-Item -LiteralPath $uvFrom -Destination (Join-Path $uvDir $uvExe) -Force
+        }
+      }
+      $uvStatus = "installed"
+      Write-Good "Installed $uvProbe to $(Join-Path $uvDir 'uv.exe')"
+    } catch {
+      $uvStatus = "failed"
+      Write-Note "Could not install uv ($($_.Exception.Message)). Skipping - Dough itself is unaffected."
+    } finally {
+      Remove-Item -LiteralPath $uvTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
   }
 
@@ -690,6 +760,11 @@ function Invoke-DoughSetup {
     Write-Host "  The Google Workspace CLI (gws) is installed but not connected." -ForegroundColor Yellow
     Write-Host "  Nothing was shared with Google. To connect Sheets, Docs and Drive, ask"
     Write-Host "  Claude Code to ""connect Google Workspace"" when you need it."
+  }
+  if ($uvStatus -eq "failed") {
+    Write-Host ""
+    Write-Host "  uv could not be installed (see above). Dough works without it, but Agent" -ForegroundColor Yellow
+    Write-Host "  Factory needs it: re-run this installer, or install it from https://docs.astral.sh/uv/"
   }
   Write-Host ""
 }

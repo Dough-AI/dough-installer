@@ -17,9 +17,11 @@ This is the whole setup, not just the binary. In order it:
 2. downloads the right binary for your Mac (Apple Silicon or Intel) to
    `/usr/local/bin`, or `~/.local/bin` if that isn't writable, and confirms it runs;
 3. adds that directory to your `PATH` in your shell profile, if it isn't already;
-4. registers the Claude Code hooks and verifies they landed;
-5. installs the Claude Code plugin;
-6. signs you in (skipped if you already have a session).
+4. installs **uv**, the tool Agent Factory runs its scripts with, to the same
+   directory (skipped if you already have it; a failure here doesn't stop setup);
+5. registers the Claude Code hooks and verifies they landed;
+6. installs the Claude Code plugin;
+7. signs you in (skipped if you already have a session).
 
 It's safe to re-run: every step checks before it acts, so re-running is also how
 you update the CLI and the plugin. It stops at the first thing it can't fix and
@@ -34,6 +36,7 @@ runs in its own shell and can't change the `PATH` of the window you started it f
 
 Environment overrides: `DOUGH_BIN_DIR`, `DOUGH_REPO`, `DOUGH_SKIP_LOGIN=1`
 (leave `dough login` to you), `DOUGH_SKIP_PROFILE=1` (never edit a shell profile),
+`DOUGH_SKIP_UV=1` (don't install uv),
 `DOUGH_CLT_WAIT_SECONDS` (how long to wait for the Command Line Tools).
 
 ## Install (Windows)
@@ -52,10 +55,12 @@ This is the whole setup, not just the binary. In order it:
    Git Bash (`bash.exe`) that ships with it;
 3. downloads `dough.exe` to `%LOCALAPPDATA%\dough\bin`, adds it to your user PATH, and
    confirms it runs;
-4. registers the Claude Code hooks and verifies they landed;
-5. installs the Claude Code plugin;
-6. points Claude Code at Git Bash, so the desktop app does not refuse local sessions;
-7. signs you in (skipped if you already have a session).
+4. installs **uv**, the tool Agent Factory runs its scripts with, to the same folder
+   (skipped if you already have it; a failure here doesn't stop setup);
+5. registers the Claude Code hooks and verifies they landed;
+6. installs the Claude Code plugin;
+7. points Claude Code at Git Bash, so the desktop app does not refuse local sessions;
+8. signs you in (skipped if you already have a session).
 
 Python and Git come from their official installers (python.org and the Git for Windows
 GitHub release), pinned by version and SHA256 and installed for the current user, so
@@ -74,7 +79,7 @@ enough — use Alt+F4 or quit from the system tray. Claude Code reads the plugin
 hooks at startup.
 
 Environment overrides: `DOUGH_REPO` (release repo), `DOUGH_SKIP_LOGIN=1` (leave
-`dough login` to the user).
+`dough login` to the user), `DOUGH_SKIP_UV=1` (don't install uv).
 
 ## After installing
 

@@ -13,6 +13,7 @@
 #   DOUGH_REPO              release repo (default: Dough-AI/dough-installer)
 #   DOUGH_SKIP_LOGIN        set to 1 to leave `dough login` to the user
 #   DOUGH_SKIP_GWS          set to 1 to skip the Google Workspace CLI
+#   DOUGH_SKIP_UV           set to 1 to skip uv
 #   DOUGH_SKIP_PROFILE      set to 1 to never edit a shell profile
 #   DOUGH_CLT_WAIT_SECONDS  how long to wait for the Command Line Tools (default: 1200)
 #
@@ -35,6 +36,7 @@ TMP_DOWNLOAD=""
 NEW_TERMINAL_NEEDED=0
 # "installed" | "present" | "skipped" | "failed" - read by the closing summary.
 GWS_STATUS="skipped"
+UV_STATUS="skipped"
 
 # --- output ----------------------------------------------------------------
 # Human-facing output goes to stderr, so stdout stays clean for anything piping
@@ -59,6 +61,13 @@ fi
 step() { printf '\n%s==> %s%s\n' "$C_CYAN" "$1" "$C_RESET" >&2; }
 good() { printf '    %s%s%s\n' "$C_GREEN" "$1" "$C_RESET" >&2; }
 note() { printf '    %s\n' "$1" >&2; }
+
+# curl for every download here, with an end to a dead connection: give up on a
+# connect that takes over 20s, or a transfer slower than 1 KB/s for a whole
+# minute, and retry twice. A stall otherwise hangs setup forever. Stall-based,
+# not a total time limit, so a slow but working connection still gets the
+# ~110 MB CLI.
+fetch() { curl --connect-timeout 20 --speed-limit 1024 --speed-time 60 --retry 2 "$@"; }
 
 # fail <headline> [detail ...] - each argument is printed on its own line, so an
 # empty argument is a deliberate blank separator and a multi-line argument keeps
@@ -241,7 +250,7 @@ install_cli() {
 
   note "Downloading $asset..."
   TMP_DOWNLOAD=$(mktemp "${TMPDIR:-/tmp}/dough.XXXXXX")
-  if ! curl -fSL "$CURL_PROGRESS" "$url" -o "$TMP_DOWNLOAD"; then
+  if ! fetch -fSL "$CURL_PROGRESS" "$url" -o "$TMP_DOWNLOAD"; then
     fail \
       "Could not download $asset." \
       "" \
@@ -515,8 +524,8 @@ install_gws() {
   base="https://github.com/googleworkspace/cli/releases/latest/download"
 
   gws_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/gws.XXXXXX")
-  if ! curl -fsSL "$base/$asset" -o "$gws_tmp_dir/$asset" ||
-     ! curl -fsSL "$base/$asset.sha256" -o "$gws_tmp_dir/$asset.sha256"; then
+  if ! fetch -fsSL "$base/$asset" -o "$gws_tmp_dir/$asset" ||
+     ! fetch -fsSL "$base/$asset.sha256" -o "$gws_tmp_dir/$asset.sha256"; then
     rm -rf "$gws_tmp_dir"
     GWS_STATUS="failed"
     note "Could not download $asset. Skipping - Dough itself is unaffected."
@@ -570,6 +579,98 @@ install_gws() {
   good "Installed $gws_version to $BIN_DIR/gws"
 }
 
+# --- uv --------------------------------------------------------------------
+
+# Installs uv (and uvx), the Python tool runner Agent Factory runs its scripts
+# with: `uv run --with ... script.py`. Only the binaries: no shell-profile edits
+# and no remote install script, the same shape as install_gws. The Agent Factory
+# skill itself is NOT installed here - it is enabled for selected people only,
+# and they fetch it with `dough skill sync @dough/agent-factory`.
+#
+# Failure here is NOT fatal: only Agent Factory needs uv, and a download problem
+# must not take the rest of a working Dough setup with it.
+install_uv() {
+  step "uv (Python tool runner)"
+
+  if [ "${DOUGH_SKIP_UV:-}" = "1" ]; then
+    UV_STATUS="skipped"
+    note "Skipped (DOUGH_SKIP_UV=1)."
+    return 0
+  fi
+
+  # Already usable - including one from astral's own installer, brew or pipx.
+  if existing=$(command -v uv 2>/dev/null) && [ -n "$("$existing" --version 2>/dev/null)" ]; then
+    UV_STATUS="present"
+    good "Already installed at $existing"
+    return 0
+  fi
+
+  arch=$(uname -m)
+  case "$arch" in
+    arm64 | aarch64) uv_target="aarch64-apple-darwin" ;;
+    x86_64 | amd64) uv_target="x86_64-apple-darwin" ;;
+    *)
+      UV_STATUS="failed"
+      note "Unsupported architecture for uv: $arch. Skipping."
+      return 0
+      ;;
+  esac
+
+  asset="uv-${uv_target}.tar.gz"
+  base="https://github.com/astral-sh/uv/releases/latest/download"
+
+  uv_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/uv.XXXXXX")
+  if ! fetch -fsSL "$base/$asset" -o "$uv_tmp_dir/$asset" ||
+     ! fetch -fsSL "$base/$asset.sha256" -o "$uv_tmp_dir/$asset.sha256"; then
+    rm -rf "$uv_tmp_dir"
+    UV_STATUS="failed"
+    note "Could not download $asset. Skipping - Dough itself is unaffected."
+    return 0
+  fi
+
+  # Hashes compared directly, as for gws: `shasum -c` would also insist the
+  # local filename match the one in the .sha256.
+  want=$(awk '{print $1}' "$uv_tmp_dir/$asset.sha256" 2>/dev/null)
+  got=$(shasum -a 256 "$uv_tmp_dir/$asset" 2>/dev/null | awk '{print $1}')
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    rm -rf "$uv_tmp_dir"
+    UV_STATUS="failed"
+    note "Checksum mismatch for $asset. Skipping - nothing was installed."
+    return 0
+  fi
+
+  # The archive holds uv-<target>/uv and uv-<target>/uvx; take just those two.
+  if ! tar -xzf "$uv_tmp_dir/$asset" -C "$uv_tmp_dir" "uv-${uv_target}/uv" "uv-${uv_target}/uvx" 2>/dev/null; then
+    rm -rf "$uv_tmp_dir"
+    UV_STATUS="failed"
+    note "Could not unpack $asset. Skipping."
+    return 0
+  fi
+  chmod 755 "$uv_tmp_dir/uv-${uv_target}/uv" "$uv_tmp_dir/uv-${uv_target}/uvx"
+
+  # Prove it runs before it is put anywhere: a non-empty version, not merely a
+  # zero exit (a zero-byte file "runs" successfully). Same reasoning as install_cli.
+  uv_version=$("$uv_tmp_dir/uv-${uv_target}/uv" --version 2>/dev/null | head -n 1) || uv_version=""
+  if [ -z "$uv_version" ]; then
+    rm -rf "$uv_tmp_dir"
+    UV_STATUS="failed"
+    note "The downloaded uv binary did not run. Skipping."
+    return 0
+  fi
+
+  # Guarded like gws: an unwritable BIN_DIR degrades to a note, never stops main.
+  if ! mv "$uv_tmp_dir/uv-${uv_target}/uv" "$BIN_DIR/uv" 2>/dev/null ||
+     ! mv "$uv_tmp_dir/uv-${uv_target}/uvx" "$BIN_DIR/uvx" 2>/dev/null; then
+    rm -rf "$uv_tmp_dir"
+    UV_STATUS="failed"
+    note "Could not place uv in $BIN_DIR. Skipping - Dough itself is unaffected."
+    return 0
+  fi
+  rm -rf "$uv_tmp_dir"
+  UV_STATUS="installed"
+  good "Installed $uv_version to $BIN_DIR/uv"
+}
+
 summarise() {
   printf '\n%sDough is set up.%s\n\n' "$C_GREEN" "$C_RESET" >&2
   printf '%sOne thing left, and it matters:%s\n' "$C_YELLOW" "$C_RESET" >&2
@@ -582,6 +683,11 @@ summarise() {
       "$C_YELLOW" "$C_RESET" >&2
     printf '  Nothing was shared with Google. To connect Sheets, Docs and Drive, ask\n' >&2
     printf '  Claude Code to "connect Google Workspace" when you need it.\n' >&2
+  fi
+  if [ "$UV_STATUS" = "failed" ]; then
+    printf '\n  %suv could not be installed%s (see above). Dough works without it, but Agent\n' \
+      "$C_YELLOW" "$C_RESET" >&2
+    printf '  Factory needs it: re-run this installer, or install it from https://docs.astral.sh/uv/\n' >&2
   fi
   if [ "$NEW_TERMINAL_NEEDED" = "1" ]; then
     printf '\n  Open a new terminal before using the dough command. This installer runs in\n' >&2
@@ -607,6 +713,7 @@ main() {
   install_cli
   ensure_on_path
   install_gws
+  install_uv
   install_hooks
   install_plugin
   sign_in
