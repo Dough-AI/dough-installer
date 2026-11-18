@@ -524,6 +524,75 @@ check "the step never touches the gws config dir" "clean" \
 check "the step never calls the Dough API" "clean" \
   "$(grep -qE 'client-config|usedough' "$gws_code" && printf dirty || printf clean)"
 
+# --- install_uv -------------------------------------------------------------
+# uv runs Agent Factory's scripts. The step installs the uv and uvx binaries and
+# nothing else: no shell-profile edits, no remote install script, and never the
+# Agent Factory skill, which is enabled for selected people only.
+
+fake_uv() { # fake_uv <path>
+  cat >"$1" <<'FAKEUV'
+#!/bin/sh
+[ "$1" = "--version" ] || exit 1
+echo "uv 9.9.9 (aaaaaaaaa 2026-01-01)"
+FAKEUV
+  chmod 755 "$1"
+}
+
+uv_bin="$work/uv-bin"
+mkdir -p "$uv_bin"
+fake_uv "$uv_bin/uv"
+
+check "an existing uv is left alone" "present" \
+  "$(run 'install_uv >/dev/null 2>&1; printf %s "$UV_STATUS"' "PATH=$uv_bin:/usr/bin:/bin")"
+
+check "DOUGH_SKIP_UV=1 skips it" "skipped" \
+  "$(run 'install_uv >/dev/null 2>&1; printf %s "$UV_STATUS"' DOUGH_SKIP_UV=1)"
+
+# CONTROL: without the skip and without a uv on PATH, it must NOT report
+# "skipped" - otherwise the assertion above would pass for the wrong reason.
+check "CONTROL: no uv and no skip does not report skipped" "not-skipped" \
+  "$(run 'BIN_DIR="$PWD/nowhere"; install_uv >/dev/null 2>&1; if [ "$UV_STATUS" = skipped ]; then printf skipped; else printf not-skipped; fi' "PATH=/usr/bin:/bin")"
+
+# A failure (here: nowhere to put the binary) leaves the rest of setup intact.
+check "a uv failure is non-fatal" "0" \
+  "$(status 'BIN_DIR="$PWD/nowhere"; install_uv >/dev/null 2>&1' "PATH=/usr/bin:/bin")"
+
+check "a uv failure is reported as failed, for the summary" "failed" \
+  "$(run 'BIN_DIR="$PWD/nowhere"; install_uv >/dev/null 2>&1; printf %s "$UV_STATUS"' "PATH=/usr/bin:/bin")"
+
+uv_code="$work/uv-code.sh"
+sed -n '/^install_uv()/,/^}/p' "$DOUGH_TEST_LIB" | sed 's/#.*$//' >"$uv_code"
+
+check "CONTROL: the uv step body was actually extracted" "yes" \
+  "$([ -s "$uv_code" ] && printf yes || printf no)"
+
+check "the uv step never runs astral's remote install script" "clean" \
+  "$(grep -qF 'astral.sh/uv/install' "$uv_code" && printf dirty || printf clean)"
+
+check "the uv step never edits a shell profile" "clean" \
+  "$(grep -qE 'zshrc|bashrc|bash_profile|zprofile|\.profile' "$uv_code" && printf dirty || printf clean)"
+
+check "main runs the uv step" "yes" \
+  "$(sed -n '/^main()/,/^}/p' "$DOUGH_TEST_LIB" | grep -qx '  install_uv' && printf yes || printf no)"
+
+# Agent Factory is enabled for selected people only: the installer never syncs it.
+check "the installer never fetches the Agent Factory skill" "clean" \
+  "$(sed 's/#.*$//' "$DOUGH_TEST_LIB" | grep -qE 'skill sync|agent-factory' && printf dirty || printf clean)"
+
+# --- fetch -----------------------------------------------------------------
+# Every download ends a dead connection instead of hanging setup: a stall-based
+# limit, not a total one, so a slow but working connection still finishes.
+curl_args="$work/curl-args"
+mkdir -p "$curl_args"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' >"$curl_args/curl"
+chmod +x "$curl_args/curl"
+check "fetch gives up on a stalled or unreachable download" "--connect-timeout 20 --speed-limit 1024 --speed-time 60 --retry 2" \
+  "$(TEST_PATH="$curl_args:/usr/bin:/bin" run 'fetch -fsSL https://example.invalid/x' | head -n 8 | tr '\n' ' ' | sed 's/ $//')"
+
+# Comments stripped: they mention curl, and the download calls must not.
+check "every download goes through fetch" "clean" \
+  "$(sed 's/#.*$//' "$DOUGH_TEST_LIB" | grep -v '^fetch()' | grep -v '^INSTALL_CMD=' | grep -qE '(^|[^a-z_])curl -f' && printf dirty || printf clean)"
+
 echo
 if [ "$fail" -eq 0 ]; then
   printf '%d passed, 0 failed\n\n' "$pass"
